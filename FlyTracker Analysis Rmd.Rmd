@@ -1,0 +1,660 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+This R markdown code was used to compile and analyze FlyTracker x,y data in Wilson et al, 2022.
+Author: Emily Petruccelli, Ph.D. (Southern Illinois University Edwardsville) <-- not an R master
+
+```{r}
+#Load required libraries
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+library(reshape2)
+library(RColorBrewer) 
+library(plyr) 
+library(Rmisc)
+library(ggpubr)
+library(trajr)
+library(tidyr)
+library(dplyr)
+```
+
+Set the working directory - folder containing list of .xls files to be analyzed + a key.csv file should contain headers that match the following:
+Video.name,	Video,	ROI,	Num.flies,	Geno,	TotalFrames,	VideoDuration.min, 35mm
+
+```{r}
+file.list <- list.files(pattern='*.xls')
+video.key <- read.csv("key.csv")
+```
+
+Stack Datasets and use TrajR package to analyze
+```{r}
+#Make empty variables to fill with all the data 
+all_coords<-c() #coordinates from the raw/original .xls files
+all_data<-c() #trajr filtered by ROI 35mm, filled in x,y coordinates and new variables/features added
+
+#For loop each .xls
+for (i in 1:length(file.list))
+{
+  #Get video subkey
+  subkey<-filter(video.key,Video.name %in% file.list[i])
+  
+  #Compile data from .xls based on key
+  coords<-c()
+    for (ii in 1:sum(subkey$Num.flies)+1){
+      sub<-read_excel(file.list[i],sheet=ii,range=paste("A1:","B",subkey$TotalFrames[1],sep="")) #only taking A1,B columns (x,y coords)
+      coords<-rbind(coords,sub)
+    }
+  colnames(coords)<-c("x","y") #used to be posx,posy
+  
+  ## COORDS
+  #Label with metadata from Key #New columns
+  coords$time<-rep(1:(subkey$TotalFrames[1]-1),subkey$Num.flies)
+  coords$time.min<-coords$time/30/60
+  geno<-c()
+  for (ii in 1:dim(subkey)[1]){ 
+    temp<-paste(rep(subkey$Geno[ii],subkey$Num.flies[ii]*dim(sub)[1]))
+    geno<-c(geno,temp)
+    }
+  coords$geno<-geno
+  coords$fly<-rep(1:subkey$Num.flies,each=dim(sub)[1])
+  coords$vid_ROI<-paste(subkey$Video[1],"_",subkey$ROI[1],sep="")
+  coords$fullgenotype<-paste(subkey$fullgenotype)
+  coords$cond<-paste(subkey$Condition)
+  
+  #Make all x,y == 0 be a 'not a number' since this is poor tracking...less than 0.1% of video should be NA
+  #coords[, 1:2][coords[, 1:2] == 0] <- NA
+  
+  #Remove anything outside of 35mm circle ROI
+  circ<-matrix(c(max(coords$x,na.rm=T)/2,
+              max(coords$y,na.rm=T)/2,
+              ###440), nrow=1) #17.5mm radius, 35mm circle circum.== 420pxl... so allow 440 ish?
+              subkey$X35mm+20), nrow=1) #17.5mm radius, 35mm circle circum.== 420pxl... so allow 440 ish?
+  incirc<-function(x,y){
+    new<-((x-circ[1])^2 + (y-circ[2])^2) < circ[3]^2
+    return(new)
+    }
+  coords$circle<-incirc(coords$x,coords$y)
+  coords_sub<-filter(coords,circle=="TRUE")
+  print(summary(coords$circle))
+  
+  print("Coords made and labeled")
+  print(paste(i))
+  
+  #Make a trajr, scale to mm, interpolate NA points, calculate derivatives
+    trjs<-list() #make a trj for each fly
+    for (ii in 1:subkey$Num.flies){
+      temp<-na.exclude(filter(coords_sub, fly==ii)) #gets rid of NAs per fly,  dataframes of diff sizes
+      trj<-TrajFromCoords(temp,xCol=1,yCol=2,timeCol=3)
+      ####trj<-TrajScale(trj, (0.035 / 450), "m") #35mm had a length of 420 pixels, output in m
+      trj<-TrajScale(trj, (0.035 / subkey$X35mm), "m") #35mm had a length of image pixels, output in m
+      trj<-TrajResampleTime(trj,1) #interpolation, adds missing time units
+      #trjsmo<-TrajSmoothSG(trj, p=3, n=31)
+      name<-paste(paste(subkey$video.name[1]),'vid',paste(subkey$Video[1]),'fly',ii,sep='_') #name the individual trjs
+      trjs[[name]]<-trj #two sets of brackets because trjs is a list of lists
+    }
+  
+    for (ii in 1:length(trjs)){
+      derivs<-TrajDerivatives(trjs[[ii]]) #speed and acceleration
+      ang<-list(TrajAngles(trjs[[ii]])) #turning angles (radians) of a trajectory, for every time point
+      trjs[[ii]]<-c(trjs[[ii]],derivs,ang=ang) #add the trajr data to the butt of trjs
+    }
+    
+    #pull from trjs, put into a dataframe with columns for each feature
+    x.trj<-c()  #pxl
+    y.trj<-c()  #pxl
+    title<-c()
+    time<-c()   #frames
+    time.min<-c() #min
+    fly<-c()
+    speed<-c()  #trajr is m/frame
+    acc<-c()  #trajr is m/frame^2
+    ang<-c()
+
+    for (ii in 1:subkey$Num.flies){
+      temp<-trjs[[ii]]
+      x.trj<-c(x.trj,temp$x)
+      y.trj<-c(y.trj,temp$y)
+      title<-c(title,rep(names(trjs)[ii],length(temp$x)))
+      time<-c(time,temp$time)
+      fly<-c(fly,c(rep(paste(ii),length(temp$x))))
+      speed<-c(speed,c(0,temp$speed))  
+      acc<-c(acc,c(0,temp$acceleration,0))  
+      #intervals <- TrajSpeedIntervals(trj, fasterThan = 2)
+      ang<-c(ang,c(0,temp$ang,0))
+    }
+flytrackerdata<-data.frame(geno=paste(subkey$Geno),vid_ROI=paste(subkey$Video[1],"_",subkey$ROI[1],sep=""),fullgenotype=paste(subkey$fullgenotype),cond=paste(subkey$Condition),title=title,fly=fly,x.trj=x.trj,y.trj=y.trj,time=time,time.min=time/30/60,speed=speed,acc=acc,ang=ang)
+
+  #add cummulative distance traveled
+  cumDist<-c() 
+  for (j in 1:length(unique(flytrackerdata$fly))){
+    temp<-filter(flytrackerdata,fly==j)
+    temp2<-cumsum(temp$speed)
+    cumDist<-c(cumDist,temp2)
+    }
+  flytrackerdata$cumDist<-cumDist
+
+  all_coords<-rbind(all_coords,coords) #still includes poor tracking outside of ROI
+  all_data<-rbind(all_data,flytrackerdata) #only has filtered data
+}    
+print("Ready for Dplyr!")
+```
+
+Dplyr-ing
+```{r}
+#calculate x0,y0,vapor,vap columns and make binned time data
+anchorit<-function(m){(m - min(m))}
+#stretchit<-function(m){(m - min(m))/(max(m)-min(m))}
+
+all_flytrackerdata<-all_data %>% group_by(geno,fullgenotype,cond,vid_ROI,title) %>% 
+  mutate(x0=anchorit(x.trj),y0=anchorit(y.trj),uniquefly=paste(geno,title,sep="")) %>%
+  mutate(vap=ifelse(time.min<=2,"a","e")) %>%  
+  mutate(vapor=ifelse(time.min<=2, "a",ifelse(time.min<=4, "e1",
+                  ifelse(time.min<=6, "e2",ifelse(time.min<=8, "e3", "e4"))))) %>%
+  mutate(bin=as.numeric(sub("[^,]*,([^]]*)\\]","\\1",cut(time.min,breaks = seq(0,10,1/5)))))
+
+
+all_binflytrackerdata <- all_flytrackerdata %>% group_by(geno,fullgenotype,cond,vid_ROI,uniquefly,bin) %>%
+  summarise(across(c("speed","acc","ang","cumDist","x0","y0"), ~mean(.x,na.rm=T)))
+
+
+#graphing the all_ variables (takes a bit of time to do)
+b<-melt(all_flytrackerdata,id=c("geno","vid_ROI","fullgenotype","cond","title","fly","time","time.min","uniquefly", "vap","vapor","bin"), variable.name = "feat")
+bdots<-summarySE(b,measurevar='value',groupvars= ~geno~vid_ROI~fullgenotype~cond~feat,na.rm = TRUE)
+bmean<-summarySE(bdots,measurevar='value',groupvars= ~geno~fullgenotype~cond~feat,na.rm = TRUE)
+bargraphs <- ggplot(bmean,aes(geno,value,fill=geno))+
+  facet_wrap(~feat,scales='free',nrow=2)+
+  scale_y_continuous(expand = c(0, 0))+
+  #geom_flat_violin(alpha=0.2,position = position_nudge(x = 0.2))+
+  geom_col(color="black",width=0.8)+
+  geom_errorbar(aes(ymin=value-se,ymax=value+se),width=0.2)+
+  geom_jitter(data=bdots, size=0.5,alpha=0.6,width=0.2)+
+  theme_classic(base_size = 12)+
+  theme(legend.position = "none", axis.text.x = element_blank())
+
+
+l<-melt(all_binflytrackerdata,id=c("geno","fullgenotype","cond","vid_ROI","uniquefly","bin"), variable.name = "feat")
+ldots<-summarySE(l,measurevar='value',groupvars= ~geno~fullgenotype~cond~vid_ROI~bin~feat,na.rm = TRUE)
+lmean<-summarySE(ldots,measurevar='value',groupvars= ~geno~fullgenotype~cond~bin~feat,na.rm = TRUE)
+linegraphs <- ggplot(lmean,aes(x=bin,y=value,group=geno,color=geno))+  
+  geom_rect(xmin=2, xmax=10, ymin=0, ymax=Inf, fill="lightgray",color=NA, alpha=0.5)+
+  geom_vline(xintercept = 2,linetype='dashed') + 
+  facet_wrap(~feat,scales='free',nrow=2) + 
+  geom_ribbon(aes(ymin=value-se,ymax=value+se,fill=as.factor(geno)),color=NA,alpha=.4)+
+  geom_line()+ 
+  theme_classic(base_size = 12)
+
+
+ggarrange(bargraphs,linegraphs, ncol=2,widths = c(0.5,1))
+
+```
+
+# somewhat hackish solution to get half violins:
+# https://twitter.com/EamonCaddigan/status/646759751242620928
+# based mostly on copy/pasting from ggplot2 geom_violin source:
+# https://github.com/hadley/ggplot2/blob/master/R/geom-violin.r
+# credit goes to David Robinson https://twitter.com/drob
+```{r}
+"%||%" <- function(a, b) {
+        if (!is.null(a)) a else b
+}
+
+#' A Flat Violin plot
+#'
+#' @param mapping See \code{\link[ggplot2]{geom_violin}}
+#' @param data See \code{\link[ggplot2]{geom_violin}}
+#' @param position See \code{\link[ggplot2]{geom_violin}}
+#' @param trim See \code{\link[ggplot2]{geom_violin}}
+#' @param scale See \code{\link[ggplot2]{geom_violin}}
+#' @param show.legend See \code{\link[ggplot2]{geom_violin}}
+#' @param inherit.aes See \code{\link[ggplot2]{geom_violin}}
+#' @param ...
+#'
+#' @export
+#'
+#' @examples
+#' library(ggplot2)
+#' ggplot(diamonds, aes(cut, carat)) +
+#' geom_flat_violin() +
+#' coord_flip()
+#'
+geom_flat_violin <- function(mapping = NULL, data = NULL, stat = "ydensity",
+                             position = "dodge", trim = TRUE, scale = "area",
+                             show.legend = NA, inherit.aes = TRUE, ...) {
+        ggplot2::layer(
+                data = data,
+                mapping = mapping,
+                stat = stat,
+                geom = GeomFlatViolin,
+                position = position,
+                show.legend = show.legend,
+                inherit.aes = inherit.aes,
+                params = list(
+                        trim = trim,
+                        scale = scale,
+                        ...
+                )
+        )
+}
+
+
+GeomFlatViolin <-
+        ggplot2::ggproto("GeomFlatViolin", ggplot2::Geom,
+                setup_data = function(data, params) {
+                        data$width <- data$width %||%
+                                params$width %||% (ggplot2::resolution(data$x, FALSE) * 0.9)
+
+                        # ymin, ymax, xmin, and xmax define the bounding rectangle for each group
+                        data %>%
+                                dplyr::group_by(group) %>%
+                                dplyr::mutate(ymin = min(y),
+                                       ymax = max(y),
+                                       xmin = x,
+                                       xmax = x + width / 2)
+
+                },
+
+                draw_group = function(data, panel_scales, coord) {
+                        # Find the points for the line to go all the way around
+                        data <- transform(data, xminv = x,
+                                          xmaxv = x + violinwidth * (xmax - x))
+
+                        # Make sure it's sorted properly to draw the outline
+                        newdata <- rbind(plyr::arrange(transform(data, x = xminv), y),
+                                         plyr::arrange(transform(data, x = xmaxv), -y))
+
+                        # Close the polygon: set first and last point the same
+                        # Needed for coord_polar and such
+                        newdata <- rbind(newdata, newdata[1,])
+
+                        ggplot2:::ggname("geom_flat_violin", ggplot2::GeomPolygon$draw_panel(newdata, panel_scales, coord))
+                },
+
+                draw_key = ggplot2::draw_key_polygon,
+
+                default_aes = ggplot2::aes(weight = 1, colour = "grey20", fill = "white", size = 0.5,
+                                  alpha = NA, linetype = "solid"),
+
+                required_aes = c("x", "y")
+        )
+
+```
+
+Diagnostic Heatmaps.. may take a while to run.
+```{r}
+all_binflytrackerdata %>% 
+ggplot(.,aes(x0,y0))+stat_density2d(aes(fill=..density..),geom='raster',contour = F,n=100)+  
+  facet_wrap(~geno)+
+  scale_fill_distiller(palette='RdYlBu')+
+  coord_equal()+
+  scale_y_reverse()+
+  theme_classic()
+
+all_flytrackerdata %>%
+ggplot(.,aes(x0,y0))+stat_density2d(aes(fill=..density../30/60),geom='raster',contour = F,n=100)+
+  facet_wrap(~geno)+
+  scale_fill_distiller(palette='RdYlBu',limits=c(0,6),breaks=seq(0,6,by=.5))+
+  coord_equal()+
+  scale_y_reverse()+
+  theme_classic()
+```
+
+
+
+Speed and Air-Baseline adjusting
+```{r}
+all_flytrackerdata_sub<-all_flytrackerdata
+all_binflytrackerdata_sub <- all_flytrackerdata %>% group_by(geno,vid_ROI,fullgenotype,cond,uniquefly,bin,vap,vapor) %>% summarise(across(c("speed"), ~mean(.x,na.rm=T)))
+
+
+
+ldots<-summarySE(all_binflytrackerdata_sub,measurevar='speed',groupvars= ~geno~fullgenotype~cond~vid_ROI~bin,na.rm = TRUE)
+lmean<-summarySE(ldots,measurevar='speed',groupvars= ~geno~fullgenotype~cond~bin,na.rm = TRUE)
+linegraphs <- ggplot(lmean,aes(x=bin,y=speed*1000*30,group=geno,color=geno))+  
+  geom_rect(xmin=2, xmax=10, ymin=0, ymax=Inf, fill="lightgray",color=NA, alpha=0.5)+
+  geom_vline(xintercept = 2,linetype='dashed') + 
+  facet_wrap(~cond,nrow=1) + 
+  geom_ribbon(aes(ymin=(speed-se)*1000*30,ymax=(speed+se)*1000*30,fill=as.factor(geno)),color=NA,alpha=.4)+
+  geom_line()+ ylab("Speed (mm/sec)")+ 
+  theme_classic(base_size = 12)
+
+lbase <- all_binflytrackerdata_sub %>% group_by(geno,vid_ROI,uniquefly) %>% mutate(speed.base=speed - mean(speed[vap=="a"]))
+ldots<-summarySE(lbase,measurevar='speed.base',groupvars= ~geno~fullgenotype~cond~vid_ROI~bin,na.rm = TRUE)
+lmean<-summarySE(ldots,measurevar='speed.base',groupvars= ~geno~fullgenotype~cond~bin,na.rm = TRUE)
+linegraphs.base <- ggplot(lmean,aes(x=bin,y=speed.base*1000*30,group=geno,color=geno))+  
+  geom_rect(xmin=2, xmax=10, ymin=0, ymax=Inf, fill="lightblue",color=NA, alpha=0.5)+
+  geom_vline(xintercept = 2,linetype='dashed') + geom_hline(yintercept = 0)+
+  facet_wrap(~cond,nrow=1) + 
+  geom_ribbon(aes(ymin=(speed.base-se)*1000*30,ymax=(speed.base+se)*1000*30,fill=as.factor(geno)),color=NA,alpha=.4)+
+  geom_line()+ylab("Speed (mm/sec)")+ 
+  theme_classic(base_size = 12)
+
+
+b <- all_flytrackerdata_sub %>% group_by(geno,fullgenotype,cond,vid_ROI,uniquefly,bin,vap,vapor) %>% filter(cumDist == max(cumDist))
+bdots<-summarySE(b,measurevar='cumDist',groupvars= ~geno~vid_ROI~fullgenotype~cond~vap,na.rm = TRUE)
+bmean<-summarySE(bdots,measurevar='cumDist',groupvars= ~geno~fullgenotype~cond~vap,na.rm = TRUE)
+bargraphs <- ggplot(bmean,aes(geno,cumDist,fill=geno))+
+  scale_y_continuous(expand = c(0, 0))+
+  geom_col(color="black",width=0.8)+
+  geom_flat_violin(data=b,alpha=0.2,position = position_nudge(x = 0.2))+
+  geom_errorbar(aes(ymin=cumDist-se,ymax=cumDist+se),width=0.2)+
+  geom_jitter(data=bdots, size=0.5,alpha=0.6,width=0.2)+ facet_wrap(~vap)+
+  theme_classic(base_size = 12)+ylab("Total Distance Traveled (m)")+
+  theme(legend.position = "none", axis.text.x = element_blank())
+
+bbase <- all_flytrackerdata_sub %>% group_by(geno,vid_ROI,uniquefly) %>% mutate(dist.m=cumDist - mean(cumDist[vap=="a"])) #%>% filter(dist.m == max(dist.m))
+bdots<-summarySE(bbase,measurevar='dist.m',groupvars= ~geno~vid_ROI~fullgenotype~cond~vap,na.rm = TRUE)
+bmean<-summarySE(bdots,measurevar='dist.m',groupvars= ~geno~fullgenotype~cond~vap,na.rm = TRUE)
+bargraphs.base <- ggplot(bmean,aes(geno,dist.m,fill=geno))+
+  facet_wrap(~vap,nrow=1)+geom_rect(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf, fill="lightblue",color=NA, alpha=0.5)+
+  scale_y_continuous(expand = c(0, 0))+
+  geom_col(color="black",width=0.8)+
+  geom_flat_violin(data=bbase,alpha=0.2,position = position_nudge(x = 0.2))+
+  geom_errorbar(aes(ymin=dist.m-se,ymax=dist.m+se),width=0.2)+
+  geom_jitter(data=bdots, size=0.5,alpha=0.6,width=0.2)+
+  theme_classic(base_size = 12)+ylab("EtOH-Distance Traveled (m)")+
+  theme(legend.position = "none", axis.text.x = element_blank())
+
+
+ggarrange(linegraphs,bargraphs,linegraphs.base,bargraphs.base, nrow=2,ncol=2,widths = c(1,0.5))
+
+```
+
+
+Histogramical for speed
+```{r}
+all_flytrackerdata_sub<-all_flytrackerdata
+#by cond wrap geno
+flies<-summarySE(all_flytrackerdata_sub,measurevar = "speed",groupvars = ~geno~cond~fullgenotype~vid_ROI~uniquefly~vap)
+ROIs<-summarySE(flies,measurevar = "speed",groupvars = ~geno~cond~fullgenotype~vid_ROI~vap)
+ROIsmean<-summarySE(ROIs,measurevar = "speed",groupvars = ~geno~cond~fullgenotype~vap)
+
+ggplot(flies,aes(x=speed,group=geno,fill=geno))+
+  geom_density(alpha=0.3)+
+  #geom_jitter(aes(x=speed.avg,y=1,color=geno))+
+  geom_rug(aes(color=geno))+
+  geom_vline(data = ROIsmean,aes(xintercept = speed,color=geno,linetype=as.factor(cond)))+  
+  theme_classic()+theme(legend.position="top")+
+  facet_wrap(~vap~fullgenotype)
+  #facet_wrap(~vap)
+
+
+```
+
+
+
+
+
+###Making figures###
+```{r}
+all_binflytrackerdata <- all_flytrackerdata %>% group_by(geno,fullgenotype,cond,vid_ROI,uniquefly,bin,vap) %>%
+  dplyr::summarise(across(c("speed","acc","ang","cumDist","x0","y0"), ~mean(.x,na.rm=T)))
+sub<-subset(all_binflytrackerdata,geno %in% unique(video.key$Geno)[1:6]) 
+
+sub<-subset(all_binflytrackerdata,geno %in% unique(video.key$Geno)[1:3]) 
+sub<-subset(all_binflytrackerdata,geno %in% unique(video.key$Geno)[4:6]) 
+sub<-subset(all_binflytrackerdata,geno %in% unique(video.key$Geno)[7:9]) 
+sub<-subset(all_binflytrackerdata,cond %in% unique(video.key$Condition)[1])
+sub<-subset(all_binflytrackerdata,cond %in% unique(video.key$Condition)[2])
+sub<-subset(all_binflytrackerdata,cond %in% unique(video.key$Condition)[3])
+
+ROIdots<-summarySE(sub,measurevar="speed",groupvars= ~fullgenotype~cond~geno~vid_ROI~bin)
+ROI<-summarySE(ROIdots,measurevar = "speed",groupvars = ~fullgenotype~cond~geno~bin)
+
+line<-ggplot(ROI,aes(x=bin,y=speed*1000*30))+
+  #geom_rect(xmin=2, xmax=10, ymin=-Inf, ymax=Inf, fill="thistle1", alpha=0.9,color=NA)+
+  geom_rect(xmin=2, xmax=10, ymin=0, ymax=0.5, fill="grey10", alpha=0.9,color=NA)+
+  geom_hline(yintercept = 0)+
+  geom_ribbon(aes(ymin=(speed-se)*1000*30,ymax=(speed+se)*1000*30,fill=geno),alpha=.6)+
+  geom_vline(xintercept = 2,linetype='dashed')+ geom_line(aes(color=geno))+ 
+  geom_point(aes(shape=geno,color=geno))+
+  scale_x_continuous(name="",breaks=seq(0,10,2)) +
+  scale_y_continuous(name="",expand = c(0, 0),limits = c(0,14),breaks=seq(0,14,2))+
+  #facet_wrap(~fullgenotype)+   
+  #scale_fill_manual(values=c("gray50","red","gray"))+
+  #scale_color_manual(values=c("gray50","red","gray"))+
+      #scale_fill_manual(values=c("gray","gray50","red"))+
+      #scale_color_manual(values=c("gray","gray50","red"))+
+        scale_fill_manual(values=c("gray50","gray40","red","red3","gray"))+
+        scale_color_manual(values=c("gray50","gray40","red","red3","gray"))+
+      #scale_fill_manual(values=c("gray50","gray40","gray10","red","red3","gray","gray70"))+
+      #scale_color_manual(values=c("gray50","gray40","gray10","red","red3","gray","gray70"))+
+  theme_classic(base_size = 14) + 
+      theme(legend.text=element_text(size=10),
+            axis.text.x = element_text(color="black"),
+            axis.text.y = element_text(color="black"),
+            axis.ticks = element_line(color = "black")) #+ 
+      theme(legend.position = "none")
+
+
+edist <- sub %>% group_by(geno,vid_ROI,uniquefly) %>% mutate(dist.m=cumDist - max(cumDist[vap=="a"])) 
+ROIdots<-summarySE(edist,measurevar='dist.m',groupvars= ~geno~vid_ROI~fullgenotype~cond~vap,na.rm = TRUE)
+ROImean<-summarySE(ROIdots,measurevar='dist.m',groupvars= ~geno~fullgenotype~cond~vap,na.rm = TRUE)
+
+m<-filter(ROImean,vap=="e")
+s<-filter(ROIdots,vap=="e")
+flydots<-summarySE(edist,measurevar='dist.m',groupvars= ~geno~vid_ROI~uniquefly~fullgenotype~cond~vap,na.rm = TRUE)
+b<-filter(flydots,vap=="e")
+bar<-ggplot(m,aes(geno,dist.m,fill=geno))+
+  #geom_rect(xmin=0, xmax=Inf, ymin=-Inf, ymax=Inf, fill="thistle1", alpha=0.9,color=NA)+
+  geom_col(color="black",width=0.4)+
+    #scale_fill_manual(values=c("gray50","red","gray"))+
+      #scale_fill_manual(values=c("gray","gray50","red"))+
+      scale_fill_manual(values=c("gray50","gray40","red","red3","gray"))+
+      #scale_fill_manual(values=c("gray50","gray40","red","red3","gray88","gray70","gray"))+
+    geom_errorbar(aes(ymin=dist.m-se,ymax=dist.m+se),width=0.2)+
+    geom_jitter(data=s,aes(shape=geno),size=2,alpha=0.8,width=0.1)+
+  geom_flat_violin(data=b,alpha=0.2,position = position_nudge(x = 0.2))+
+    geom_point(data=b, size=0.5,alpha=0.6,position = position_nudge(x = 0.3))+
+  #ylab("EtOH-Induced Distance (m)")+ xlab("Genotype")+
+  ylab("")+ xlab("")+ facet_wrap(~vap)+
+  scale_y_continuous(expand = c(0, 0),limits = c(0,4))+
+  #scale_x_discrete(limits=c("Cs_naive_50","Cs_3x24air_50","Cs_3x24etoh_50"))+
+  theme_classic(base_size = 14) + 
+  theme(legend.position = "none",
+        axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color="white"),strip.text.x = element_blank(),
+        axis.ticks = element_line(color = "black"))
+
+  
+  
+#2min
+all_binflytrackerdata <- all_flytrackerdata %>% group_by(geno,fullgenotype,cond,vid_ROI,uniquefly,bin,vap,vapor) %>%
+  dplyr::summarise(across(c("speed","cumDist"), ~mean(.x,na.rm=T)))
+
+sub<-subset(all_binflytrackerdata,geno %in% unique(video.key$Geno)[1:6]) 
+sub<-subset(all_binflytrackerdata,cond %in% unique(video.key$Condition)[2])
+
+edist <- sub %>% group_by(geno,vid_ROI,uniquefly) %>% mutate(dist.m=cumDist - max(cumDist[vap=="a"])) 
+edist2 <- edist %>% group_by(geno,vid_ROI,uniquefly,vapor)%>% mutate(dist.t=max(dist.m)-min(dist.m))
+
+ROIdots2<-summarySE(edist2,measurevar='dist.t',groupvars= ~geno~vid_ROI~fullgenotype~cond~vapor,na.rm = TRUE)
+ROImean2<-summarySE(ROIdots2,measurevar='dist.t',groupvars= ~geno~fullgenotype~cond~vapor,na.rm = TRUE)
+
+m2<-filter(ROImean2,ROImean2$vapor !="a")
+s2<-filter(ROIdots2,ROIdots2$vapor !="a")
+flydots2<-summarySE(edist2,measurevar='dist.t',groupvars= ~geno~vid_ROI~uniquefly~fullgenotype~cond~vapor,na.rm = TRUE)
+b2<-filter(flydots2,flydots2$vapor !="a")
+bar2<-ggplot(m2,aes(geno,dist.t,fill=geno))+
+  geom_col(color="black",width=0.4)+
+  ylab("")+ xlab("")+ facet_wrap(~vapor, nrow=1)+
+    #scale_fill_manual(values=c("gray50","red","gray"))+
+      #scale_fill_manual(values=c("gray","gray50","red"))+
+      scale_fill_manual(values=c("gray50","gray40","red","red3","gray"))+
+      #scale_fill_manual(values=c("gray50","gray40","red","red3","gray88","gray70","gray"))+
+    geom_errorbar(aes(ymin=dist.t-se,ymax=dist.t+se),width=0.2)+
+    geom_jitter(data=s2,aes(shape=geno),size=2,alpha=0.8,width=0.1)+
+  geom_flat_violin(data=b2,alpha=0.2,position = position_nudge(x = 0.2))+
+    geom_point(data=b2, size=0.5,alpha=0.6,position = position_nudge(x = 0.3))+
+  #ylab("EtOH-Induced Distance (m)")+ xlab("Genotype")+
+  scale_y_continuous(expand = c(0, 0),limits = c(0,2))+
+  #scale_x_discrete(limits=c("Cs_naive_50","Cs_3x24air_50","Cs_3x24etoh_50"))+
+  theme_classic(base_size = 14) #+ 
+  theme(legend.position = "none",
+        axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color="white"),strip.text.x = element_blank(),
+        axis.ticks = element_line(color = "black"))
+  
+  
+  
+
+  
+  
+ggarrange(line,bar,nrow=1
+          ,widths = c(1,0.5)
+          )
+ggarrange(bar,bar2,nrow=1
+          ,widths = c(0.2,1)
+          )
+ggsave("figure.png", width = 5, height = 3, units = "in",dpi=600)
+
+
+
+#STATS
+s<-filter(ROIdots,vap=="e")
+res.aov<-aov(s$dist.m ~ s$geno)
+summary(res.aov)
+TukeyHSD(res.aov)
+
+flydots<-summarySE(bbase,measurevar='dist.m',groupvars= ~geno~vid_ROI~uniquefly~fullgenotype~cond~vap,na.rm = TRUE)
+b<-filter(flydots,vap=="e")
+res.aov<-aov(b$dist.m ~ b$geno)
+summary(res.aov)
+TukeyHSD(res.aov)
+
+#2min
+s2<-filter(ROIdots2,ROIdots2$vapor !="a")
+res.aov<-aov(s2$dist.t ~ s2$geno + s2$vapor) #not sure if I should use + or *
+summary(res.aov)
+TukeyHSD(res.aov) #not sure if I should use Tukey here
+
+
+```
+
+just bar graphs
+```{r}
+sub <- all_flytrackerdata %>% group_by(geno,fullgenotype,cond,vid_ROI,uniquefly,bin,vap) %>%
+  dplyr::summarise(across(c("speed","acc","ang","cumDist","x0","y0"), ~mean(.x,na.rm=T)))
+edist <- sub %>% group_by(geno,vid_ROI,uniquefly) %>% mutate(dist.m=cumDist - max(cumDist[vap=="a"])) %>% filter(cond %in% c("3x24air","3x24etoh")) 
+ROIdots<-summarySE(edist,measurevar='dist.m',groupvars= ~geno~vid_ROI~fullgenotype~cond~vap,na.rm = TRUE)
+ROImean<-summarySE(ROIdots,measurevar='dist.m',groupvars= ~geno~fullgenotype~cond~vap,na.rm = TRUE)
+
+m<-filter(ROImean,vap=="e")
+s<-filter(ROIdots,vap=="e")
+flydots<-summarySE(edist,measurevar='dist.m',groupvars= ~geno~vid_ROI~uniquefly~fullgenotype~cond~vap,na.rm = TRUE)
+b<-filter(flydots,vap=="e")
+bar<-ggplot(m,aes(geno,dist.m,fill=geno))+
+  facet_wrap(~cond)+
+  geom_rect(xmin=0, xmax=Inf, ymin=-Inf, ymax=Inf, fill="thistle1", alpha=0.9,color=NA)+
+  geom_col(color="black",width=0.4)+
+    scale_fill_manual(values=rep(c("gray50","red","gray"),each=2))+
+    geom_errorbar(aes(ymin=dist.m-se,ymax=dist.m+se),width=0.2)+
+    geom_jitter(data=s,aes(shape=geno),size=2,alpha=0.8,width=0.1)+
+  geom_flat_violin(data=b,alpha=0.2,position = position_nudge(x = 0.2))+
+    geom_point(data=b, size=0.5,alpha=0.6,position = position_nudge(x = 0.3))+
+  #ylab("EtOH-Induced Distance (m)")+ xlab("Genotype")+
+  ylab("")+ xlab("")+ facet_wrap(~vap)+
+  scale_y_continuous(expand = c(0, 0),limits = c(0,4))+
+  #scale_x_discrete(limits=c("Cs_naive_50","Cs_3x24air_50","Cs_3x24etoh_50"))+
+  theme_classic(base_size = 20) + theme(legend.text=element_text(size=10),axis.text.x = element_text(color="white"),strip.text.x = element_blank())# + theme(legend.position = "none")
+
+
+setoh<-filter(ROIdots,vap=="e" & cond=="3x24etoh")
+sair<-filter(ROIdots,vap=="e"& cond=="3x24air")
+amean<-summarySE(sair,measurevar = "dist.m",groupvars = ~geno~fullgenotype)
+
+out<-c()
+for (i in 1:length(unique(setoh$fullgenotype))){
+  temp<-filter(setoh,fullgenotype %in% unique(setoh$fullgenotype)[i])
+  temp2<-filter(amean,fullgenotype %in% unique(setoh$fullgenotype)[i])
+  temp$dif<-temp$dist.m - temp2$dist.m
+  out<-rbind(out,temp)
+}
+outmean<-summarySE(out,measurevar='dif',groupvars= ~geno~fullgenotype~cond~vap,na.rm = TRUE)
+difbar<-ggplot(outmean,aes(geno,dif,fill=geno))+
+  geom_rect(xmin=0, xmax=Inf, ymin=-Inf, ymax=Inf, fill="thistle1", alpha=0.9,color=NA)+
+  geom_col(color="black",width=0.4)+
+    scale_fill_manual(values=rep(c("gray50","red","gray")))+
+    geom_errorbar(aes(ymin=dif-se,ymax=dif+se),width=0.2)+
+    geom_jitter(data=out,aes(shape=geno),size=2,alpha=0.8,width=0.1)+
+  geom_flat_violin(data=out,alpha=0.2,position = position_nudge(x = 0.2))+
+  ylab("")+ xlab("")+
+  geom_hline(yintercept=0)+
+  #scale_x_discrete(limits=c("Cs_naive_50","Cs_3x24air_50","Cs_3x24etoh_50"))+
+  theme_classic(base_size = 20) + theme(legend.text=element_text(size=10),axis.text.x = element_text(color="white"),strip.text.x = element_blank()) + theme(legend.position = "none")
+
+
+ggarrange(bar,difbar,nrow=1,widths = c(1,0.5))
+
+
+
+#STATS
+s<-filter(ROIdots,vap=="e")
+#test normality
+for (i in 1:length(unique(s$geno))){
+  temp<-filter(s,geno %in% unique(s$geno)[i])
+  print(shapiro.test(temp$dist.m))}
+#test homoscedasticity (Bartlett’s test is used to test if variances across samples is equal. It is sensitive to departures from normality. The Levene test is an alternative test that is less sensitive to departures from normality.)
+bartlett.test(s$dist.m ~ s$geno)
+res.aov<-aov(s$dist.m ~ s$geno*s$cond)
+summary(res.aov)
+TukeyHSD(res.aov)
+
+flydots<-summarySE(bbase,measurevar='dist.m',groupvars= ~geno~vid_ROI~uniquefly~fullgenotype~cond~vap,na.rm = TRUE)
+b<-filter(flydots,vap=="e")
+res.aov<-aov(s$dist.m ~ s$cond*s$geno)
+summary(res.aov)
+TukeyHSD(res.aov)
+
+res.aov<-aov(out$dif~out$geno)
+summary(res.aov)
+TukeyHSD(res.aov)
+
+```
+
+
+```{r}
+###Tracking Paths
+ramp<-colorRampPalette(rev(brewer.pal(11,'Spectral')))
+cramp<-ramp(32)
+a<-filter(all_flytrackerdata_sub, vid_ROI%in%c("2_1","2_2","2_3","1_1","1_2","1_3") & fly=="4")
+
+ggplot(a, aes(x0,y0)) + 
+  #stat_density2d(aes(fill=..density../30/60),geom='raster',contour = F,n=100)+  #get minutes 
+  #scale_fill_distiller(palette ='RdYlBu',limits=c(0,6),breaks=seq(0,6,by=.5))+
+  geom_path(aes(color=speed*1000*30))+ #get mm/sec
+  scale_color_distiller(palette ='RdYlBu',limits=c(0,80),breaks=seq(0,80,by=20))+
+  facet_wrap(~vap~geno~cond,nrow=2)+ coord_equal()+ scale_y_reverse()+ theme_classic()
+
+ggplot(a, aes(x0,y0)) + 
+  geom_path(aes(color=time.min))+ #get mm/sec
+  scale_color_distiller(palette ='Spectral',limits=c(0,10),breaks=seq(0,10,by=0.2))+
+  facet_wrap(~geno~vapor~cond,nrow=3)+ coord_equal()+ scale_y_reverse()+ theme_classic()
+
+###Heatmap-ing
+b<-all_binflytrackerdata_sub %>% group_by(uniquefly,bin,geno) %>% summarise(speed=mean(speed,na.rm=T),n=n()) %>% arrange(speed)
+ggplot(b,aes(bin,uniquefly))+
+  geom_tile(aes(fill=speed*1000*30))+
+  scale_fill_distiller(palette ='Spectral',limits=c(0,16),breaks=seq(0,16,by=2),na.value = "red")+
+  facet_wrap(~geno,scales='free',nrow=2)+
+  theme(axis.text.y = element_text(size = 5))
+  
+
+sub<-filter(all_binflytrackerdata_sub,fullgenotype %in%  unique(all_binflytrackerdata_sub$fullgenotype)[2])
+c<-sub %>% group_by(uniquefly,bin,geno,vid_ROI) %>% summarise(speed=mean(speed,na.rm=T),n=n()) %>% arrange(speed)
+fly<-ggplot(c,aes(bin,uniquefly))+
+  geom_tile(aes(fill=speed*1000*30))+
+  scale_fill_distiller(palette ='Spectral',limits=c(0,16),breaks=seq(0,16,by=2),na.value = "red")+
+  facet_wrap(~geno,scales='free',nrow=1)
+d<-c %>% group_by(bin,geno) %>% summarise(speed=mean(speed,na.rm=T),n=n())
+mean<-ggplot(d,aes(bin,geno))+
+  geom_tile(aes(fill=speed*1000*30))+
+  scale_fill_distiller(palette ='Spectral',limits=c(0,16),breaks=seq(0,16,by=2),na.value = "red")+
+  facet_wrap(~geno,scales='free',nrow=1)
+
+ggarrange(fly,mean,nrow=2,heights = c(1,0.2))
+```
+
+
