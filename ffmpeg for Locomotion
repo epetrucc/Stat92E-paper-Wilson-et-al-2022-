@@ -1,0 +1,73 @@
+Using ffmpeg to capture and convert lab videos for a PC
+
+INSTALL
+
+For Windows:
+	1. Go to http://ffmpeg.zeranoe.com
+	2. Download ‘static build’ for ’64-bit’ 
+	3. Make a New Folder called ‘ffmpeg’ in C:/
+	4. Add the installed folder contents to this new ffmpeg folder  
+  5. Add ffmpeg to path by…
+      Open a File Explorer window, right click on ‘This PC’…
+      ‘Properties’ 
+		  ‘Advanced system settings’
+		  ‘Environment variables…’
+		-top window -> ‘New…’	-> Variable name: path    ->Variable value: C:\ffmpeg\bin
+
+
+All coding is indented
+
+PREVIEW A VIDEO to Ensure Proper Camera Set Up (remember to change file name bolded below)
+  ffmpeg -f dshow -rtbufsize 100M -i video="HD USB Camera" -t 00:10:00 -vf format=gray -vf "drawtext=fontfile=/path/to/Arial.ttf:fontsize=45:fontcolor=white:box=1:boxcolor=black:x=(W-tw)/2:y=H-th:text='Time\: %{pts\:hms}'" -an -c:v libx264 -q 0 -f h264 - | ffmpeg -f h264 -i - -an -c:v copy -f mp4 file5.mp4 -an -c:v copy -f h264 pipe:play | ffplay -i pipe:play
+
+
+RECORD A 10MIN VIDEO 
+
+Example Video 1:
+ffmpeg -rtbufsize 100M -f dshow -i video=”HD USB Camera” -t 00:10:10 -vf format=gray vid1.mp4
+
+Example Video 2:
+ffmpeg -rtbufsize 100M -f dshow -i video=”HD USB Camera” -t 00:10:10 -vf format=gray vid2.mp4
+
+
+CONVERT AND CROP AND TRIM (adjust video size and location [0,0] is top left in images...
+For intstance, to crop a 80×60 section, starting from position (200, 100)...
+ffmpeg –i vid.avi –filter:v “crop=80:60:200:100” –y vidout.mp4 )
+
+Example Video 1:
+  ffmpeg -ss 00:00:10 -i vid1.mp4 -to 00:10:10 -pix_fmt yuv420p -filter_complex "[0:v]crop=550:550:500:0[out1];[0:v]crop=550:550:1000:0[out2];[0:v]crop=550:550:500:500[out3] ;[0:v]crop=550:550:1000:500[out4]" -map "[out1]" vid1conROI1.mp4 -map "[out2]" vid1conROI2.mp4 -map "[out3]" vid1conROI3.mp4 -map "[out4]" vid1conROI4.mp4
+
+Example Video 2:
+  ffmpeg -ss 00:00:10 -i vid1.mp4 -to 00:10:10 -pix_fmt yuv420p -filter_complex "[0:v]crop=550:550:500:0[out1];[0:v]crop=550:550:1000:0[out2];[0:v]crop=550:550:500:500[out3] ;[0:v]crop=550:550:1000:500[out4]" -map "[out1]" vid2conROI1.mp4 -map "[out2]" vid2conROI2.mp4 -map "[out3]" vid2conROI3.mp4 -map "[out4]" vid2conROI4.mp4
+
+
+
+HELP AND TROUBLESHOOTING
+
+ffmpeg cheat codes: https://www.cheatography.com/thetartankilt/cheat-sheets/ffmpeg/ 
+ffmpeg manual: man ffmpeg 
+ffmpeg help: ffmpeg -h 
+
+
+Error: Video device not found “0:none”: Input/output error
+Check if your USB camera is being detected and how its indexed. To get a list of devices installed:
+  ffmpeg -f avfoundation -list_devices true -i “” This will list available video and audio devices.
+
+
+To play video:	
+  ffplay inputvideo.mp4
+
+q to quit or press ‘esc’
+
+To speed up / slow down video:
+  ffmpeg -i inputvideo.mp4 -vf “setpts=0.5*PTS” outputvideo.mp4  (sped)
+  ffmpeg -i inputvideo.mp4 -vf “setpts=4.0*PTS” outputvideo.mp4  (slow)
+
+Get .avi video file information:
+  ffmpeg -i inputvideo.mp4 -hide_banner
+
+Break video down into pictures: Can use with various video formats (avi, mov, mp4, etc.) and image formats (jpeg, png, jpg, etc.) “new” is a folder on the Desktop that images write into)
+  ffmpeg -i inputvideo.mp4 -vf fps=30 new/out%d.png 
+
+Add timestamp to places:
+  ffmpeg -i inputvideo.mp4 –vf “drawtext=fontfile=/path/to/Arial.ttf:fontsize=45:fontcolor=yellow:box=1:boxcolor=black:x=(W-tw)/2:y=H-th:text=’Time\: %{pts\:hms}’” temp.mp4
